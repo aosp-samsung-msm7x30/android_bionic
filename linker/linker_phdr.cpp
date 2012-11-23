@@ -122,7 +122,7 @@
 ElfReader::ElfReader(const char* name, int fd, off64_t file_offset)
     : name_(name), fd_(fd), file_offset_(file_offset),
       phdr_num_(0), phdr_mmap_(nullptr), phdr_table_(nullptr), phdr_size_(0),
-      load_start_(nullptr), load_size_(0), load_bias_(0),
+      load_start_(nullptr), load_size_(0), load_bias_(0), required_base_(0),
       loaded_phdr_(nullptr) {
 }
 
@@ -286,6 +286,36 @@ size_t phdr_table_get_load_size(const ElfW(Phdr)* phdr_table, size_t phdr_count,
   return max_vaddr - min_vaddr;
 }
 
+typedef struct {
+    long mmap_addr;
+    char tag[4]; /* 'P', 'R', 'E', ' ' */
+} prelink_info_t;
+
+/* Returns the requested base address if the library is prelinked,
+ * and 0 otherwise.  */
+static ElfW(Addr) is_prelinked(int fd, const char *name)
+{
+    off_t sz = lseek(fd, -sizeof(prelink_info_t), SEEK_END);
+    if (sz < 0) {
+        DL_ERR("lseek() failed!");
+        return 0;
+    }
+
+    prelink_info_t info;
+    int rc = TEMP_FAILURE_RETRY(read(fd, &info, sizeof(info)));
+    if (rc != sizeof(info)) {
+        DL_ERR("Could not read prelink_info_t structure for `%s`\n", name);
+        return 0;
+    }
+
+    if (memcmp(info.tag, "PRE ", 4)) {
+        DL_ERR("`%s` is not a prelinked library\n", name);
+        return 0;
+    }
+
+    return (unsigned long)info.mmap_addr;
+}
+
 // Reserve a virtual address range big enough to hold all loadable
 // segments of a program header table. This is done by creating a
 // private anonymous mmap() with PROT_NONE.
@@ -317,7 +347,12 @@ bool ElfReader::ReserveAddressSpace(const android_dlextinfo* extinfo) {
              reserved_size - load_size_, load_size_, name_);
       return false;
     }
+    required_base_ = is_prelinked(fd_, name_);
     int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    if (required_base_ != 0) {
+      mmap_flags |= MAP_FIXED;
+      addr = (uint8_t*) required_base_;
+    }
     start = mmap(addr, load_size_, PROT_NONE, mmap_flags, -1, 0);
     if (start == MAP_FAILED) {
       DL_ERR("couldn't reserve %zd bytes of address space for \"%s\"", load_size_, name_);
@@ -328,7 +363,7 @@ bool ElfReader::ReserveAddressSpace(const android_dlextinfo* extinfo) {
   }
 
   load_start_ = start;
-  load_bias_ = reinterpret_cast<uint8_t*>(start) - addr;
+  load_bias_ = reinterpret_cast<uint8_t*>(start) - reinterpret_cast<uint8_t*>(min_vaddr);
   return true;
 }
 
